@@ -8,7 +8,7 @@ FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 # newest tag (format `vYYYY.M.D`, e.g. `v2026.4.23`) and update the default
 # below. Use `main` only if you accept that every rebuild can pull arbitrary
 # new upstream commits.
-ARG HERMES_REF=v2026.5.7
+ARG HERMES_REF=v2026.5.16
 
 # tini = tiny init that we run as PID 1. Without it, hermes's grandchild
 # processes (MCP stdio servers, git, bun, browser daemons spawned by tools)
@@ -26,6 +26,16 @@ RUN apt-get update && \
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
     rm -rf /var/lib/apt/lists/*
+
+# Install GitHub CLI so the agent can do `gh pr create`, `gh issue list`,
+# clone private repos, etc. when given a GITHUB_TOKEN env var. Static
+# binary from the official cli/cli release — pinned for build reproducibility.
+ARG GH_VERSION=2.92.0
+RUN cd /tmp && \
+    curl -sL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" | tar xz && \
+    mv "gh_${GH_VERSION}_linux_amd64/bin/gh" /usr/local/bin/gh && \
+    chmod +x /usr/local/bin/gh && \
+    rm -rf "/tmp/gh_${GH_VERSION}_linux_amd64"
 
 # Install hermes-agent (provides the `hermes` CLI) and pre-build its React
 # dashboard so `hermes dashboard` has nothing to build at runtime.
@@ -47,6 +57,15 @@ RUN git clone --depth 1 --branch ${HERMES_REF} https://github.com/NousResearch/h
     npm install --silent --no-fund --no-audit --progress=false && \
     npm run build && \
     rm -rf /opt/hermes-agent/web /opt/hermes-agent/.git /root/.npm
+
+# Defensive patch for delegate_tool.py: validate override_acp_command
+# binaries actually exist on PATH before forcing the copilot-acp transport.
+# Without this, a model that hallucinates acp_command="copilot" in a
+# delegate_task call crashes the subagent and can take the whole gateway
+# down. Upstream fix: https://github.com/NousResearch/hermes-agent/pull/27426
+# Remove this RUN once the PR merges and HERMES_REF is bumped past it.
+COPY patches/delegate_tool_acp_guard.py /tmp/delegate_tool_acp_guard.py
+RUN python3 /tmp/delegate_tool_acp_guard.py && rm /tmp/delegate_tool_acp_guard.py
 
 # Why pre-build ui-tui (and why we don't delete it after):
 # - The dashboard's embedded Chat tab spawns `node ui-tui/dist/entry.js`

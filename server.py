@@ -248,15 +248,41 @@ def write_env(path: Path, data: dict[str, str]) -> None:
     path.write_text("\n".join(lines))
 
 
+def _has_oauth_provider() -> bool:
+    """True if ``$HERMES_HOME/auth.json`` records at least one provider
+    with stored OAuth credentials (xai-oauth, openai-codex, nous, etc.).
+
+    Hermes stores OAuth tokens outside of .env (in auth.json), so a
+    provider-keys-only readiness check would treat OAuth-only deployments
+    as "not configured" and never spawn the gateway. We check the auth
+    store directly so xai-oauth (SuperGrok) / Codex / Nous Portal /
+    Gemini-CLI / etc. all satisfy the gate without needing a placeholder
+    API-key env var.
+    """
+    auth_file = Path(HERMES_HOME) / "auth.json"
+    if not auth_file.exists():
+        return False
+    try:
+        data = json.loads(auth_file.read_text())
+    except (json.JSONDecodeError, OSError):
+        return False
+    providers = data.get("providers") or {}
+    return bool(providers)
+
+
 def is_config_complete(data: dict[str, str] | None = None) -> bool:
     """Single source of truth for 'ready to run the gateway'.
 
     Used by: GET / redirect, auto_start on boot, admin API status.
+
+    Accepts EITHER an API-key style provider env var OR an OAuth-based
+    provider stored in auth.json — so SuperGrok / Codex / Nous / etc.
+    deployments don't need a placeholder env var to satisfy the gate.
     """
     if data is None:
         data = read_env(ENV_FILE)
     has_model = bool(data.get("LLM_MODEL"))
-    has_provider = any(data.get(k) for k in PROVIDER_KEYS)
+    has_provider = any(data.get(k) for k in PROVIDER_KEYS) or _has_oauth_provider()
     return has_model and has_provider
 
 
