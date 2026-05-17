@@ -7,3 +7,8 @@ httpx>=0.27.0
 # hermes's /api/pty, /api/ws, /api/events endpoints. httpx does not speak
 # WebSockets, so we need a dedicated client library.
 websockets>=12.0
+
+# FastHTML for agent-built /projects/* mini-apps. Pure-Python frontend+backend
+# (server-rendered HTML + HTMX), single-file per project. See server.py's
+# project_dispatch handler.
+python-fasthtml>=0.6.0

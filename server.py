@@ -27,6 +27,7 @@ import os
 import re
 import secrets
 import signal
+import sys
 import time
 from collections import deque
 from contextlib import asynccontextmanager
@@ -954,6 +955,138 @@ async def route_setup_404(request: Request) -> Response:
     return Response("Not Found", status_code=404, media_type="text/plain")
 
 
+# ── /projects/<name> — agent-built mini-apps ──────────────────────────────────
+# Each project lives at /data/projects/<name>/app.py and must export an ASGI
+# `app` (FastHTML, Starlette, or any ASGI-compatible callable). On every
+# request we check the file's mtime and re-import if it changed — so the
+# agent can iterate by just rewriting app.py, no server restart needed.
+#
+# Errors during import or runtime render as friendly HTML rather than
+# bubbling up — a broken project must NEVER take the parent server down.
+#
+# Auth: same cookie auth as /setup. Public bot-built apps would need their
+# own auth model; default-deny is the safer baseline for an internet-exposed
+# admin server.
+PROJECTS_ROOT = Path("/data/projects")
+_project_cache: dict[str, tuple] = {}  # name -> (asgi_app, mtime)
+
+
+def _load_project(name: str):
+    """Import or re-import a project's ASGI app from /data/projects/<name>/app.py.
+
+    Returns (asgi_app, None) on success or (None, error_html) on failure.
+    Cache key is (name, mtime) so file edits hot-reload on next request.
+    """
+    base = PROJECTS_ROOT / name
+    app_file = base / "app.py"
+    if not app_file.exists():
+        return None, f"<h1>Project not found</h1><p>No app.py at <code>{app_file}</code></p>"
+    try:
+        mtime = app_file.stat().st_mtime
+    except OSError as exc:
+        return None, f"<h1>Project load error</h1><pre>{exc}</pre>"
+
+    cached = _project_cache.get(name)
+    if cached and cached[1] == mtime:
+        return cached[0], None
+
+    import importlib.util
+
+    mod_name = f"_hermes_projects_{name.replace('-', '_')}"
+    spec = importlib.util.spec_from_file_location(mod_name, str(app_file))
+    if spec is None or spec.loader is None:
+        return None, f"<h1>Project load error</h1><p>Could not build module spec for {app_file}</p>"
+
+    module = importlib.util.module_from_spec(spec)
+    # Make sibling files importable as a package (so app.py can do `from db import X`).
+    sys.path.insert(0, str(base))
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        import traceback as _tb
+        tb = _tb.format_exc()
+        return None, f"<h1>Project import error</h1><pre>{tb}</pre>"
+    finally:
+        try:
+            sys.path.remove(str(base))
+        except ValueError:
+            pass
+    sys.modules[mod_name] = module
+
+    asgi_app = getattr(module, "app", None)
+    if asgi_app is None:
+        return None, "<h1>Project error</h1><p><code>app.py</code> must define a module-level <code>app</code> (FastHTML/Starlette/ASGI).</p>"
+
+    _project_cache[name] = (asgi_app, mtime)
+    return asgi_app, None
+
+
+async def project_dispatch(request: Request) -> Response:
+    """Hot-reloading reverse-proxy to /data/projects/<name>/app.py's ASGI app.
+
+    Rewrites the request scope so the sub-app sees a clean root path. Any
+    exception during import or handling renders as 5xx HTML, never crashes
+    the parent server.
+    """
+    if err := guard(request): return err
+
+    name = request.path_params["name"]
+    if not re.match(r"^[a-z0-9][a-z0-9-]{0,63}$", name):
+        return Response("Invalid project name", status_code=400, media_type="text/plain")
+
+    asgi_app, err_html = _load_project(name)
+    if err_html is not None:
+        return HTMLResponse(err_html, status_code=500 if asgi_app is None else 200)
+
+    # Rewrite ASGI scope so the sub-app's routing sees `/<path>`, not
+    # `/projects/<name>/<path>`. Without this the sub-app's `@app.get("/")`
+    # never matches.
+    sub_path = request.path_params.get("path") or ""
+    new_path = "/" + sub_path
+    scope = dict(request.scope)
+    scope["path"] = new_path
+    scope["raw_path"] = new_path.encode("utf-8")
+    scope["root_path"] = f"/projects/{name}"
+
+    # Capture the sub-app's response via a minimal in-memory send buffer so
+    # we can return a Starlette Response and let Starlette handle the wire
+    # format. Streaming sub-apps still work — we buffer the body but pass
+    # status/headers through verbatim.
+    body_chunks: list[bytes] = []
+    status_code = 500
+    headers: list[tuple[bytes, bytes]] = []
+    started = False
+
+    async def _send(message):
+        nonlocal status_code, headers, started
+        t = message.get("type")
+        if t == "http.response.start":
+            status_code = message.get("status", 500)
+            headers = list(message.get("headers", []))
+            started = True
+        elif t == "http.response.body":
+            body_chunks.append(message.get("body", b""))
+
+    try:
+        await asgi_app(scope, request.receive, _send)
+    except Exception as exc:
+        import traceback as _tb
+        tb = _tb.format_exc()
+        return HTMLResponse(
+            f"<h1>Project runtime error in <code>{name}</code></h1><pre>{tb}</pre>",
+            status_code=500,
+        )
+
+    if not started:
+        return HTMLResponse(f"<h1>Empty response from project <code>{name}</code></h1>", status_code=500)
+
+    return Response(
+        b"".join(body_chunks),
+        status_code=status_code,
+        headers={k.decode("latin-1"): v.decode("latin-1") for k, v in headers},
+    )
+
+
 # ── App lifecycle ─────────────────────────────────────────────────────────────
 async def auto_start():
     if is_config_complete():
@@ -1153,6 +1286,13 @@ routes = [
 
     # /setup/* typos return a real 404 — not a silent proxy fallthrough.
     Route("/setup/{path:path}",                 route_setup_404,     methods=ANY_METHOD),
+
+    # /projects/<name>/<...> — hot-reloading dispatcher to agent-built
+    # mini-apps at /data/projects/<name>/app.py. See project_dispatch().
+    # The {path:path} suffix lets project sub-routes work; bare /projects/<name>
+    # also matches (path becomes "").
+    Route("/projects/{name}",                   project_dispatch,    methods=ANY_METHOD),
+    Route("/projects/{name}/{path:path}",       project_dispatch,    methods=ANY_METHOD),
 
     # Reverse-proxy hermes's dashboard WebSockets (Chat tab + sidecar).
     # WebSocketRoute is matched independently of HTTP routes, so order
