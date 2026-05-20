@@ -37,6 +37,18 @@ RUN cd /tmp && \
     chmod +x /usr/local/bin/gh && \
     rm -rf "/tmp/gh_${GH_VERSION}_linux_amd64"
 
+# Install xurl (official X / Twitter CLI) so the agent can read AND write
+# to X with auto-refreshing OAuth 2.0 tokens. Config + tokens live at
+# /data/.xurl (volume-persistent). Bearer token covers reads; OAuth 2.0
+# user-context covers writes (post, follow, like, DM). xurl auto-refreshes
+# expired access tokens via the stored refresh token, so the agent never
+# has to think about expiry.
+ARG XURL_VERSION=1.1.1
+RUN cd /tmp && \
+    curl -sL "https://github.com/xdevplatform/xurl/releases/download/v${XURL_VERSION}/xurl_Linux_x86_64.tar.gz" | tar xz && \
+    mv xurl /usr/local/bin/xurl && \
+    chmod +x /usr/local/bin/xurl
+
 # Install hermes-agent (provides the `hermes` CLI) and pre-build its React
 # dashboard so `hermes dashboard` has nothing to build at runtime.
 # Deleting web/ afterwards makes hermes's internal _build_web_ui skip the
