@@ -61,6 +61,15 @@ HERMES_DASHBOARD_HOST = "127.0.0.1"
 HERMES_DASHBOARD_PORT = int(os.environ.get("HERMES_DASHBOARD_PORT", "9119"))
 HERMES_DASHBOARD_URL = f"http://{HERMES_DASHBOARD_HOST}:{HERMES_DASHBOARD_PORT}"
 
+# Hermes webhook platform (event-driven agent activation via HTTP POST).
+# Binds loopback inside the container; we reverse-proxy public /webhooks/*
+# to it so external services hit our admin server's HTTPS endpoint instead.
+# Auth at this layer is per-route HMAC validated by hermes itself — NOT
+# our admin cookie auth, which would reject any non-browser caller.
+HERMES_WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST", "127.0.0.1")
+HERMES_WEBHOOK_PORT = int(os.environ.get("WEBHOOK_PORT", "8644"))
+HERMES_WEBHOOK_URL = f"http://{HERMES_WEBHOOK_HOST}:{HERMES_WEBHOOK_PORT}"
+
 # Mirror dashboard-ref-only/auth_proxy.py: strip only `host` (httpx sets it)
 # and `transfer-encoding` (httpx recomputes it from the body). Keep everything
 # else — notably `authorization`, because the SPA uses Bearer tokens against
@@ -955,6 +964,67 @@ async def route_setup_404(request: Request) -> Response:
     return Response("Not Found", status_code=404, media_type="text/plain")
 
 
+async def route_webhook_proxy(request: Request) -> Response:
+    """Reverse-proxy /webhooks/<...> to hermes's loopback webhook listener.
+
+    NOT auth-gated — external services POST here from arbitrary origins.
+    Hermes's webhook platform validates per-route HMAC signatures before
+    invoking any agent run, so guarding at this layer would block every
+    legitimate caller (none of which have our admin cookie).
+
+    If the webhook platform isn't running (WEBHOOK_ENABLED unset), the
+    upstream connect fails and we return 503 — which is the correct signal
+    to external services that nothing's listening.
+    """
+    client = get_http_client()
+    target = f"{HERMES_WEBHOOK_URL}{request.url.path}"
+    if request.url.query:
+        target = f"{target}?{request.url.query}"
+
+    req_headers = {
+        k: v for k, v in request.headers.items()
+        if k.lower() not in HOP_BY_HOP
+    }
+    body = await request.body()
+
+    try:
+        upstream = await client.request(
+            request.method,
+            target,
+            headers=req_headers,
+            content=body,
+        )
+    except (httpx.ConnectError, httpx.ConnectTimeout):
+        return Response(
+            "Webhook listener unavailable (WEBHOOK_ENABLED not set or gateway down)",
+            status_code=503,
+            media_type="text/plain",
+        )
+    except httpx.RequestError as e:
+        print(f"[webhook-proxy] upstream error for {request.method} {request.url.path}: {e}", flush=True)
+        return Response(f"Bad gateway: {e}", status_code=502, media_type="text/plain")
+
+    if upstream.status_code >= 400:
+        body_snip = upstream.content[:200].decode("utf-8", errors="replace")
+        print(
+            f"[webhook-proxy] {request.method} {request.url.path} -> {upstream.status_code} "
+            f"body={body_snip!r}",
+            flush=True,
+        )
+
+    resp_headers = {
+        k: v for k, v in upstream.headers.items()
+        if k.lower() not in HOP_BY_HOP
+        and k.lower() not in ("content-encoding", "content-length")
+    }
+
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        headers=resp_headers,
+    )
+
+
 # ── /projects/<name> — agent-built mini-apps ──────────────────────────────────
 # Each project lives at /data/projects/<name>/app.py and must export an ASGI
 # `app` (FastHTML, Starlette, or any ASGI-compatible callable). On every
@@ -1286,6 +1356,11 @@ routes = [
 
     # /setup/* typos return a real 404 — not a silent proxy fallthrough.
     Route("/setup/{path:path}",                 route_setup_404,     methods=ANY_METHOD),
+
+    # /webhooks/<...> — reverse-proxy to hermes's webhook platform on
+    # loopback. NOT auth-gated — hermes validates per-route HMAC. See
+    # route_webhook_proxy() for the security rationale.
+    Route("/webhooks/{path:path}",              route_webhook_proxy, methods=ANY_METHOD),
 
     # /projects/<name>/<...> — hot-reloading dispatcher to agent-built
     # mini-apps at /data/projects/<name>/app.py. See project_dispatch().
